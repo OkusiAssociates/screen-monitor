@@ -3,7 +3,7 @@
 Screen monitoring system for Ubuntu 24.04+ X11 desktops. Captures screenshots at regular intervals when the screen content has changed, for workflow analysis.
 
 ```bash
-git clone git@github.com:OkusiAssociates/screen-monitor.git && cd screen-monitor && sudo make deps && sudo make install && sudo make enable
+git clone https://github.com/OkusiAssociates/screen-monitor.git && cd screen-monitor && sudo make deps && sudo make install && sudo make enable
 ```
 
 ## How It Works

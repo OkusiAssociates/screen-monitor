@@ -16,7 +16,7 @@ declare -i -- CAPTURE_INTERVAL=10
 declare -- SCREENSHOT_DIR='/var/lib/screen-monitor/screenshots'
 declare -- DB_PATH='/var/lib/screen-monitor/screen-monitor.db'
 declare -- CAPTURE_FORMAT='webp'
-declare -i -- CAPTURE_QUALITY=80
+declare -i -- CAPTURE_QUALITY=50
 declare -i -- HASH_EXCLUDE_TOP=30
 
 # Runtime state
@@ -227,7 +227,7 @@ capture() {
   if [[ "$CAPTURE_FORMAT" == 'png' ]]; then
     mv "$tmpfile" "$dest"
   else
-    convert "$tmpfile" -quality "$CAPTURE_QUALITY" "$dest"
+    convert "$tmpfile" -quality "$CAPTURE_QUALITY" -define webp:method=6 "$dest"
     rm -f "$tmpfile"
   fi
   chmod 644 "$dest"

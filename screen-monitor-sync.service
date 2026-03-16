@@ -1,0 +1,8 @@
+[Unit]
+Description=Screen Monitor - Sync to Remote
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/screen-monitor-sync

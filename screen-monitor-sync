@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s inherit_errexit
+declare -rx -- PATH='/usr/local/bin:/usr/bin:/bin'
+
+# screen-monitor-sync — Sync screenshots to remote server via rclone
+# Runs as a oneshot systemd service on a timer.
+
+declare -r -- VERSION='1.0.0'
+declare -r -- PROG='screen-monitor-sync'
+declare -r -- CONF='/etc/screen-monitor.conf'
+
+# Defaults (overridden by config)
+declare -- SCREENSHOT_DIR='/var/lib/screen-monitor/screenshots'
+declare -- DB_PATH='/var/lib/screen-monitor/screen-monitor.db'
+declare -i -- SYNC_ENABLED=0
+declare -- SYNC_REMOTE=''
+declare -- SYNC_PATH=''
+
+# Runtime
+declare -- DB_BACKUP=''
+
+log() { logger -t "$PROG" "$@"; }
+
+die() { (($# < 2)) || log "FATAL: ${*:2}"; exit "${1:-1}"; }
+
+usage() {
+  cat <<EOF
+Usage: $PROG [OPTIONS]
+
+Sync screen-monitor screenshots to a remote server via rclone (WebDAV).
+Typically run via systemd timer (screen-monitor-sync.timer).
+
+Requires: rclone configured with a WebDAV remote.
+
+Options:
+  -h, --help     Show this help message
+  -V, --version  Show version
+
+Configuration: $CONF (SYNC_ENABLED, SYNC_REMOTE, SYNC_PATH)
+EOF
+}
+
+load_config() {
+  [[ -f "$CONF" ]] || die 1 "Configuration not found: $CONF"
+  # shellcheck source=/etc/screen-monitor.conf
+  source "$CONF"
+}
+
+cleanup_temp() {
+  [[ -n "$DB_BACKUP" ]] && rm -f "$DB_BACKUP"
+  true
+}
+
+sync_data() {
+  # Sync screenshots (incremental — only new/changed files)
+  rclone copy "$SCREENSHOT_DIR" "${SYNC_REMOTE}:${SYNC_PATH}/screenshots/" \
+    --update --transfers 4 --retries 3 --log-level NOTICE
+  log 'Screenshots synced'
+
+  # Sync database (atomic snapshot)
+  if [[ -f "$DB_PATH" ]]; then
+    DB_BACKUP='/tmp/screen-monitor-db-backup.db'
+    sqlite3 "$DB_PATH" ".backup $DB_BACKUP"
+    rclone copyto "$DB_BACKUP" "${SYNC_REMOTE}:${SYNC_PATH}/screen-monitor-db-backup.db" \
+      --log-level NOTICE
+    rm -f "$DB_BACKUP"
+    DB_BACKUP=''
+    log 'Database synced'
+  fi
+}
+
+main() {
+  case ${1:-} in
+    -h|--help)    usage; exit 0 ;;
+    -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+  esac
+
+  (( EUID == 0 )) || die 1 'Must run as root'
+
+  load_config
+  readonly -- SCREENSHOT_DIR DB_PATH SYNC_ENABLED SYNC_REMOTE SYNC_PATH
+
+  # Exit silently if sync is disabled
+  ((SYNC_ENABLED == 1)) || exit 0
+
+  command -v rclone >/dev/null 2>&1 || die 1 'rclone not installed (apt install rclone)'
+  [[ -n "$SYNC_REMOTE" ]] || die 1 'SYNC_REMOTE not configured'
+  [[ -n "$SYNC_PATH" ]]   || die 1 'SYNC_PATH not configured'
+  [[ -d "$SCREENSHOT_DIR" ]] || { log 'Nothing to sync (no screenshot dir)'; exit 0; }
+
+  trap cleanup_temp EXIT
+
+  log "Starting sync to ${SYNC_REMOTE}:${SYNC_PATH}/"
+  sync_data
+  log 'Sync complete'
+}
+
+main "$@"
+
+#fin

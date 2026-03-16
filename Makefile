@@ -36,13 +36,17 @@ help:
 	@echo "  sudo make deps && sudo make install && sudo make enable"
 
 deps:
-	@command -v import   >/dev/null 2>&1 || { echo "MISSING: import (imagemagick)";  exit 1; }
-	@command -v convert  >/dev/null 2>&1 || { echo "MISSING: convert (imagemagick)"; exit 1; }
-	@command -v xdotool  >/dev/null 2>&1 || { echo "MISSING: xdotool";               exit 1; }
-	@command -v sqlite3  >/dev/null 2>&1 || { echo "MISSING: sqlite3";               exit 1; }
-	@command -v md5sum   >/dev/null 2>&1 || { echo "MISSING: md5sum (coreutils)";    exit 1; }
-	@command -v loginctl >/dev/null 2>&1 || { echo "MISSING: loginctl (systemd)";    exit 1; }
-	@command -v logger   >/dev/null 2>&1 || { echo "MISSING: logger (bsdutils)";     exit 1; }
+	@pkgs=''; \
+	command -v import   >/dev/null 2>&1 || pkgs="$$pkgs imagemagick"; \
+	command -v xdotool  >/dev/null 2>&1 || pkgs="$$pkgs xdotool"; \
+	command -v sqlite3  >/dev/null 2>&1 || pkgs="$$pkgs sqlite3"; \
+	command -v md5sum   >/dev/null 2>&1 || pkgs="$$pkgs coreutils"; \
+	command -v loginctl >/dev/null 2>&1 || pkgs="$$pkgs systemd"; \
+	command -v logger   >/dev/null 2>&1 || pkgs="$$pkgs bsdutils"; \
+	if [[ -n "$$pkgs" ]]; then \
+	  echo "Installing:$$pkgs"; \
+	  apt-get install -y $$pkgs; \
+	fi
 
 install: deps
 	install -m 0755 screen-monitor         $(DESTDIR)$(BINDIR)/screen-monitor

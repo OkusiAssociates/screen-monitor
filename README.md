@@ -2,6 +2,10 @@
 
 Screen monitoring system for Ubuntu 24.04+ X11 desktops. Captures screenshots at regular intervals when the screen content has changed, for workflow analysis.
 
+```bash
+git clone git@github.com:OkusiAssociates/screen-monitor.git && cd screen-monitor && sudo make deps && sudo make install && sudo make enable
+```
+
 ## How It Works
 
 - Runs as a root-level systemd service
@@ -16,7 +20,7 @@ Screen monitoring system for Ubuntu 24.04+ X11 desktops. Captures screenshots at
 
 All tools are standard on Ubuntu 24.04+ desktop installations:
 
-- ImageMagick (`import`)
+- ImageMagick (`import`, `convert`)
 - xdotool
 - SQLite3
 - systemd
@@ -26,7 +30,7 @@ All tools are standard on Ubuntu 24.04+ desktop installations:
 ```bash
 sudo make deps      # Verify dependencies
 sudo make install   # Install scripts, config, systemd units
-sudo make enable    # Start service and cleanup timer
+sudo make enable    # Enable and start service and cleanup timer
 ```
 
 ## Configuration
@@ -67,8 +71,10 @@ Screenshots are organized by date (`YYYY/MM/DD/`) to prevent directory bloat.
 
 ```bash
 sudo make status    # Show service status and recent captures
-sudo make disable   # Stop the service
-sudo make enable    # Restart the service
+sudo make check     # Verify installed commands
+make test           # Run syntax checks (no root needed)
+sudo make disable   # Stop and disable the service
+sudo make enable    # Enable and start the service
 ```
 
 ### Query the database

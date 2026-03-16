@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s inherit_errexit
+declare -rx -- PATH='/usr/local/bin:/usr/bin:/bin'
+
+# screen-monitor-cleanup — Clean up old screenshots and manage disk usage
+# Typically run daily via systemd timer.
+
+declare -r -- VERSION='1.0.0'
+declare -r -- PROG='screen-monitor-cleanup'
+declare -r -- CONF='/etc/screen-monitor.conf'
+
+# Defaults (overridden by config)
+declare -i -- MAX_AGE_DAYS=30
+declare -i -- MAX_DISK_MB=5000
+declare -- SCREENSHOT_DIR='/var/lib/screen-monitor/screenshots'
+declare -- DB_PATH='/var/lib/screen-monitor/screen-monitor.db'
+
+log() { logger -t "$PROG" "$@"; }
+
+die() { (($# < 2)) || log "FATAL: ${*:2}"; exit "${1:-1}"; }
+
+sql_escape() { local -- v="${1//\'/\'\'}"; printf '%s' "${v//$'\n'/ }"; }
+
+usage() {
+  cat <<EOF
+Usage: $PROG [OPTIONS]
+
+Clean up old screen-monitor screenshots and manage disk usage.
+Typically run via systemd timer (screen-monitor-cleanup.timer).
+
+Options:
+  -h, --help     Show this help message
+  -V, --version  Show version
+
+Configuration: $CONF
+EOF
+}
+
+load_config() {
+  [[ -f "$CONF" ]] || die 1 "Configuration not found: $CONF"
+  # shellcheck source=/etc/screen-monitor.conf
+  source "$CONF"
+}
+
+# Delete screenshots older than MAX_AGE_DAYS
+cleanup_old_files() {
+  local -- file='' rel_path=''
+  local -i -- deleted=0
+
+  while IFS= read -r -d '' file; do
+    rel_path="${file#"${SCREENSHOT_DIR}/"}"
+    sqlite3 "$DB_PATH" "DELETE FROM captures WHERE filename = '$(sql_escape "$rel_path")';" 2>/dev/null || true
+    rm -f "$file"
+    deleted+=1
+  done < <(find "$SCREENSHOT_DIR" \( -name '*.png' -o -name '*.jpg' -o -name '*.webp' \) -mtime "+${MAX_AGE_DAYS}" -print0 2>/dev/null)
+
+  ((deleted > 0)) && log "Deleted $deleted files older than ${MAX_AGE_DAYS} days" ||:
+  return 0
+}
+
+# Trim oldest day directories if disk usage exceeds MAX_DISK_MB
+cleanup_disk_usage() {
+  local -i -- current_bytes=0 dir_bytes=0 dirs_removed=0
+  local -- oldest_dir='' date_pattern=''
+
+  current_bytes=$(du -sb "$SCREENSHOT_DIR" 2>/dev/null | awk '{print $1}') || current_bytes=0
+
+  if ((current_bytes / 1048576 <= MAX_DISK_MB)); then
+    return 0
+  fi
+
+  log "Disk usage $((current_bytes / 1048576))MB exceeds limit ${MAX_DISK_MB}MB, removing oldest days"
+
+  while ((current_bytes / 1048576 > MAX_DISK_MB)); do
+    oldest_dir=$(find "$SCREENSHOT_DIR" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort | head -1)
+    [[ -n "$oldest_dir" ]] || break
+
+    dir_bytes=$(du -sb "$oldest_dir" 2>/dev/null | awk '{print $1}') || dir_bytes=0
+    date_pattern="${oldest_dir#"${SCREENSHOT_DIR}/"}"
+
+    sqlite3 "$DB_PATH" "DELETE FROM captures WHERE filename LIKE '$(sql_escape "$date_pattern")/%';" 2>/dev/null || true
+    rm -rf "$oldest_dir"
+    current_bytes=$((current_bytes - dir_bytes))
+    ((current_bytes >= 0)) || current_bytes=0
+    dirs_removed+=1
+
+    log "Removed day ${date_pattern} (freed $((dir_bytes / 1048576))MB)"
+  done
+
+  ((dirs_removed > 0)) && log "Trimmed $dirs_removed day directories for disk space" ||:
+  return 0
+}
+
+# Remove empty date directories
+cleanup_empty_dirs() {
+  find "$SCREENSHOT_DIR" -type d -empty -delete 2>/dev/null || true
+}
+
+main() {
+  case ${1:-} in
+    -h|--help)    usage; exit 0 ;;
+    -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+  esac
+
+  (( EUID == 0 )) || die 1 'Must run as root'
+
+  load_config
+  readonly -- MAX_AGE_DAYS MAX_DISK_MB SCREENSHOT_DIR DB_PATH
+
+  [[ -d "$SCREENSHOT_DIR" ]] || { log 'Nothing to clean (no screenshot dir)'; exit 0; }
+  [[ -f "$DB_PATH" ]]        || { log 'Nothing to clean (no database)'; exit 0; }
+
+  log "Starting cleanup (max_age=${MAX_AGE_DAYS}d, max_disk=${MAX_DISK_MB}MB)"
+
+  cleanup_old_files
+  cleanup_disk_usage
+  cleanup_empty_dirs
+
+  # Vacuum database
+  sqlite3 "$DB_PATH" 'VACUUM;' 2>/dev/null || true
+
+  log 'Cleanup complete'
+}
+
+main "$@"
+
+#fin

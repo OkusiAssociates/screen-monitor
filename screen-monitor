@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s inherit_errexit
+declare -rx -- PATH='/usr/local/bin:/usr/bin:/bin'
+
+# screen-monitor — Screen monitoring daemon
+# Captures screenshots at regular intervals when screen content changes.
+# Runs as root, discovers and captures the active X11 session.
+
+declare -r -- VERSION='1.0.0'
+declare -r -- PROG='screen-monitor'
+declare -r -- CONF='/etc/screen-monitor.conf'
+
+# Defaults (overridden by config)
+declare -i -- CAPTURE_INTERVAL=10
+declare -- SCREENSHOT_DIR='/var/lib/screen-monitor/screenshots'
+declare -- DB_PATH='/var/lib/screen-monitor/screen-monitor.db'
+declare -- CAPTURE_FORMAT='webp'
+declare -i -- CAPTURE_QUALITY=80
+declare -i -- HASH_EXCLUDE_TOP=30
+
+# Runtime state
+declare -- DISPLAY_ENV=''
+declare -- XAUTHORITY_ENV=''
+declare -- PREV_HASH=''
+declare -i -- RUNNING=1
+declare -i -- TOTAL_BYTES=0
+
+log() { logger -t "$PROG" "$@"; }
+
+die() { (($# < 2)) || log "FATAL: ${*:2}"; exit "${1:-1}"; }
+
+sql_escape() { local -- v="${1//\'/\'\'}"; printf '%s' "${v//$'\n'/ }"; }
+
+cleanup() {
+  trap - SIGTERM SIGINT EXIT
+  RUNNING=0
+  log 'Shutting down (signal received)'
+}
+
+usage() {
+  cat <<EOF
+Usage: $PROG [OPTIONS]
+
+Screen monitoring daemon that captures screenshots when screen content changes.
+Must be run as root (typically via systemd).
+
+Options:
+  -h, --help     Show this help message
+  -V, --version  Show version
+
+Configuration: $CONF
+EOF
+}
+
+load_config() {
+  [[ -f "$CONF" ]] || die 1 "Configuration not found: $CONF"
+  # shellcheck source=/etc/screen-monitor.conf
+  source "$CONF"
+}
+
+discover_x11() {
+  local -- session_id='' session_type='' user='' pid='' environ='' display='' xauth=''
+  local -- line=''
+
+  while IFS= read -r line; do
+    session_id=${line%% *}
+    session_type=$(loginctl show-session "$session_id" -p Type --value 2>/dev/null) || continue
+    [[ "$session_type" == 'x11' ]] || continue
+
+    user=$(loginctl show-session "$session_id" -p Name --value 2>/dev/null) || continue
+
+    # Find X11 process for this user
+    pid=$(pgrep -u "$user" -x gnome-shell 2>/dev/null | head -1) || \
+    pid=$(pgrep -u "$user" -x kwin_x11 2>/dev/null | head -1) || \
+    pid=$(pgrep -u "$user" -x Xorg 2>/dev/null | head -1) || continue
+
+    # Extract DISPLAY and XAUTHORITY from process environment
+    environ=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || continue
+    display=$(grep '^DISPLAY=' <<< "$environ" | head -1 | cut -d= -f2-)
+    xauth=$(grep '^XAUTHORITY=' <<< "$environ" | head -1 | cut -d= -f2-)
+
+    if [[ -n "$display" && -n "$xauth" ]]; then
+      DISPLAY_ENV="$display"
+      XAUTHORITY_ENV="$xauth"
+      log "Found X11 session: user=$user display=$display pid=$pid"
+      return 0
+    fi
+  done < <(loginctl list-sessions --no-legend 2>/dev/null)
+
+  return 1
+}
+
+wait_for_x11() {
+  local -i -- attempts=0 max_attempts=60
+  log 'Waiting for X11 session...'
+  while ((attempts < max_attempts)); do
+    discover_x11 && return 0
+    sleep 5
+    attempts+=1
+  done
+  die 1 "No X11 session found after $((max_attempts * 5)) seconds"
+}
+
+init_db() {
+  mkdir -p "$(dirname "$DB_PATH")"
+  sqlite3 "$DB_PATH" <<-'SQL' >/dev/null
+	PRAGMA journal_mode=WAL;
+	CREATE TABLE IF NOT EXISTS captures (
+	  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	  timestamp   TEXT    NOT NULL,
+	  filename    TEXT    NOT NULL UNIQUE,
+	  hash        TEXT    NOT NULL,
+	  filesize    INTEGER NOT NULL,
+	  mouse_x     INTEGER,
+	  mouse_y     INTEGER,
+	  window_name TEXT,
+	  display     TEXT    NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_captures_timestamp ON captures(timestamp);
+	SQL
+  log "Database initialized: $DB_PATH"
+}
+
+enforce_disk_limit() {
+  local -- oldest_dir='' date_pattern='' today_dir=''
+  local -i -- dir_bytes=0
+
+  while ((TOTAL_BYTES / 1048576 > MAX_DISK_MB)); do
+    # Find oldest day directory (YYYY/MM/DD structure = depth 3)
+    oldest_dir=$(find "$SCREENSHOT_DIR" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort | head -1)
+    [[ -n "$oldest_dir" ]] || break
+
+    # Never delete today's directory
+    today_dir="${SCREENSHOT_DIR}/$(date '+%Y/%m/%d')"
+    [[ "$oldest_dir" != "$today_dir" ]] || break
+
+    # Measure bytes being freed
+    dir_bytes=$(du -sb "$oldest_dir" 2>/dev/null | awk '{print $1}') || dir_bytes=0
+
+    # Extract relative date pattern (YYYY/MM/DD) for SQLite
+    date_pattern="${oldest_dir#"${SCREENSHOT_DIR}/"}"
+
+    # Remove from database and filesystem
+    sqlite3 "$DB_PATH" "DELETE FROM captures WHERE filename LIKE '$(sql_escape "$date_pattern")/%';" 2>/dev/null || true
+    rm -rf "$oldest_dir"
+    TOTAL_BYTES=$((TOTAL_BYTES - dir_bytes))
+    ((TOTAL_BYTES >= 0)) || TOTAL_BYTES=0
+
+    log "Disk limit: removed ${date_pattern} (freed $((dir_bytes / 1048576))MB)"
+  done
+
+  # Clean empty parent directories (month/year)
+  find "$SCREENSHOT_DIR" -type d -empty -delete 2>/dev/null || true
+}
+
+capture() {
+  local -- tmpfile='' ts='' date_dir='' dest_dir='' filename='' dest=''
+  local -- hash='' db_timestamp='' rel_path='' window_name=''
+  local -- hash_tmpfile='' xdotool_out=''
+  local -i -- mouse_x=0 mouse_y=0 filesize=0 free_mb=0 suffix=1
+
+  # Check disk space (pause if < 500MB free)
+  free_mb=$(df -BM --output=avail "$SCREENSHOT_DIR" | tail -1 | tr -d ' M')
+  if ((free_mb < 500)); then
+    log "WARNING: Low disk space (${free_mb}MB free), skipping capture"
+    return 0
+  fi
+
+  tmpfile=$(mktemp /tmp/screen-monitor-XXXXXX.png)
+
+  # Capture screenshot
+  if ! DISPLAY="$DISPLAY_ENV" XAUTHORITY="$XAUTHORITY_ENV" \
+       import -window root -silent "$tmpfile" 2>/dev/null; then
+    rm -f "$tmpfile"
+    log 'Capture failed, re-discovering X11 session'
+    discover_x11 || log 'WARNING: X11 re-discovery failed'
+    return 1
+  fi
+
+  # Compute hash (optionally excluding top panel)
+  if ((HASH_EXCLUDE_TOP > 0)); then
+    hash_tmpfile="${tmpfile%.png}-hash.png"
+    convert "$tmpfile" -gravity North -chop "0x${HASH_EXCLUDE_TOP}" \
+      +set date:create +set date:modify "$hash_tmpfile"
+    hash=$(md5sum "$hash_tmpfile" | awk '{print $1}')
+    rm -f "$hash_tmpfile"
+  else
+    hash=$(md5sum "$tmpfile" | awk '{print $1}')
+  fi
+  if [[ "$hash" == "$PREV_HASH" ]]; then
+    rm -f "$tmpfile"
+    return 0
+  fi
+  PREV_HASH="$hash"
+
+  # Get mouse location (parse output directly, no eval)
+  xdotool_out=$(DISPLAY="$DISPLAY_ENV" XAUTHORITY="$XAUTHORITY_ENV" \
+                xdotool getmouselocation 2>/dev/null) || xdotool_out=''
+  mouse_x=$(grep -oP 'x:\K[0-9]+' <<< "$xdotool_out") || mouse_x=0
+  mouse_y=$(grep -oP 'y:\K[0-9]+' <<< "$xdotool_out") || mouse_y=0
+
+  # Get active window name
+  window_name=$(DISPLAY="$DISPLAY_ENV" XAUTHORITY="$XAUTHORITY_ENV" \
+                xdotool getactivewindow getwindowname 2>/dev/null) || window_name=''
+
+  # Build destination path
+  ts=$(date '+%Y%m%d_%H%M%S')
+  date_dir=$(date '+%Y/%m/%d')
+  dest_dir="${SCREENSHOT_DIR}/${date_dir}"
+  mkdir -p "$dest_dir"
+
+  filename="${ts}.${CAPTURE_FORMAT}"
+  dest="${dest_dir}/${filename}"
+
+  # Handle sub-second collision
+  if [[ -f "$dest" ]]; then
+    suffix=1
+    while [[ -f "${dest_dir}/${ts}_${suffix}.${CAPTURE_FORMAT}" ]]; do
+      suffix+=1
+    done
+    filename="${ts}_${suffix}.${CAPTURE_FORMAT}"
+    dest="${dest_dir}/${filename}"
+  fi
+
+  # Convert and store
+  if [[ "$CAPTURE_FORMAT" == 'png' ]]; then
+    mv "$tmpfile" "$dest"
+  else
+    convert "$tmpfile" -quality "$CAPTURE_QUALITY" "$dest"
+    rm -f "$tmpfile"
+  fi
+  chmod 644 "$dest"
+  filesize=$(stat -c %s "$dest")
+  TOTAL_BYTES+=filesize
+  ((TOTAL_BYTES / 1048576 > MAX_DISK_MB)) && enforce_disk_limit ||:
+
+  # Record in database
+  db_timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+  rel_path="${date_dir}/${filename}"
+
+  sqlite3 "$DB_PATH" \
+    "INSERT INTO captures (timestamp, filename, hash, filesize, mouse_x, mouse_y, window_name, display) \
+     VALUES ('$(sql_escape "$db_timestamp")', '$(sql_escape "$rel_path")', '$(sql_escape "$hash")', ${filesize}, ${mouse_x}, ${mouse_y}, '$(sql_escape "$window_name")', '$(sql_escape "$DISPLAY_ENV")');"
+
+  log "Captured: ${rel_path} (${filesize} bytes, mouse=${mouse_x},${mouse_y})"
+}
+
+main() {
+  # Parse arguments
+  case ${1:-} in
+    -h|--help)    usage; exit 0 ;;
+    -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+  esac
+
+  (( EUID == 0 )) || die 1 'Must run as root'
+
+  load_config
+  readonly -- CAPTURE_INTERVAL SCREENSHOT_DIR DB_PATH CAPTURE_FORMAT CAPTURE_QUALITY HASH_EXCLUDE_TOP
+
+  wait_for_x11
+
+  mkdir -p "$SCREENSHOT_DIR"
+  init_db
+
+  # Seed disk usage tracker (one-time du at startup)
+  TOTAL_BYTES=$(du -sb "$SCREENSHOT_DIR" 2>/dev/null | awk '{print $1}') || TOTAL_BYTES=0
+  log "Disk usage: $((TOTAL_BYTES / 1048576))MB / ${MAX_DISK_MB}MB"
+
+  trap cleanup SIGTERM SIGINT EXIT
+
+  log "Started (interval=${CAPTURE_INTERVAL}s, dir=${SCREENSHOT_DIR})"
+
+  local -i -- i=0
+  while ((RUNNING)); do
+    capture || true
+
+    # Interruptible sleep
+    i=0
+    while ((RUNNING && i < CAPTURE_INTERVAL)); do
+      sleep 1
+      i+=1
+    done
+  done
+
+  log 'Stopped'
+}
+
+main "$@"
+
+#fin

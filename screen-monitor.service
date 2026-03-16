@@ -1,0 +1,12 @@
+[Unit]
+Description=Screen Monitor - Workflow Screenshot Capture
+After=graphical.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/screen-monitor
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical.target

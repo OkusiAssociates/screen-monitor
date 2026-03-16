@@ -1,0 +1,6 @@
+[Unit]
+Description=Screen Monitor - Screenshot Cleanup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/screen-monitor-cleanup

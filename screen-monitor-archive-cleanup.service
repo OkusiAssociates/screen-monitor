@@ -1,0 +1,6 @@
+[Unit]
+Description=Screen Monitor Archive - Disk Rotation
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/screen-monitor-archive-cleanup

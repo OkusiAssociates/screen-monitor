@@ -4,6 +4,7 @@ CLAUDE.md
 .claude/
 BASH-CODING-STANDARD.md
 AUDIT-*.md
+SYNC-*.md
 
 __pycache__
 .venv

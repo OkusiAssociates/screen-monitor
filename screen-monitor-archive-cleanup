@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s inherit_errexit
+declare -rx -- PATH='/usr/local/bin:/usr/bin:/bin'
+
+# screen-monitor-archive-cleanup — Rotate old synced screenshots on the server
+# Deletes oldest day directories when archive exceeds disk limit.
+# Runs daily via systemd timer.
+
+declare -r -- PROG='screen-monitor-archive-cleanup'
+declare -r -- ARCHIVE_DIR='/var/lib/screen-monitor-archive'
+declare -ri -- MAX_DISK_MB=5120  # 5 GiB
+
+log() { logger -t "$PROG" "$@"; }
+
+main() {
+  local -i -- current_bytes=0 dir_bytes=0 dirs_removed=0
+  local -- oldest_rel='' oldest_dir=''
+
+  [[ -d "$ARCHIVE_DIR" ]] || exit 0
+
+  current_bytes=$(du -sb "$ARCHIVE_DIR" 2>/dev/null | awk '{print $1}') || current_bytes=0
+
+  if ((current_bytes / 1048576 <= MAX_DISK_MB)); then
+    log "Archive $((current_bytes / 1048576))MB within limit ${MAX_DISK_MB}MB"
+    return 0
+  fi
+
+  log "Archive $((current_bytes / 1048576))MB exceeds limit ${MAX_DISK_MB}MB, rotating"
+
+  # Day directories are at depth 5: <host>/screenshots/YYYY/MM/DD
+  # Sort by date (YYYYMMDD) across all hosts to find the globally oldest
+  while ((current_bytes / 1048576 > MAX_DISK_MB)); do
+    oldest_rel=$(find "$ARCHIVE_DIR" -mindepth 5 -maxdepth 5 -type d -printf '%P\n' 2>/dev/null |
+      awk -F/ '{printf "%s%s%s %s\n", $(NF-2), $(NF-1), $NF, $0}' | sort | head -1 | cut -d' ' -f2-)
+    [[ -n "$oldest_rel" ]] || break
+
+    oldest_dir="${ARCHIVE_DIR}/${oldest_rel}"
+    dir_bytes=$(du -sb "$oldest_dir" 2>/dev/null | awk '{print $1}') || dir_bytes=0
+
+    rm -rf "$oldest_dir"
+    current_bytes=$((current_bytes - dir_bytes))
+    ((current_bytes >= 0)) || current_bytes=0
+    dirs_removed+=1
+
+    log "Removed ${oldest_rel} (freed $((dir_bytes / 1048576))MB)"
+  done
+
+  # Clean empty parent directories (month/year/host)
+  find "$ARCHIVE_DIR" -type d -empty -delete 2>/dev/null || true
+
+  ((dirs_removed > 0)) && log "Rotated $dirs_removed day directories, now $((current_bytes / 1048576))MB" ||:
+}
+
+main "$@"
+
+#fin
